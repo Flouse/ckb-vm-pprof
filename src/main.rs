@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use ckb_vm::{instructions::instruction_length, Bytes, CoreMachine, Memory, Register};
+use ckb_vm::machine::asm::{AsmCoreMachine, AsmMachine};
+use ckb_vm::{decoder::build_decoder, Error, Machine, SupportMachine};
+use ckb_vm::{instructions::instruction_length, Bytes, CoreMachine, DefaultMachineBuilder, Register};
 
 mod cost_model;
-mod machine;
 
 #[allow(dead_code)]
 fn sprint_loc_file_line(loc: &Option<addr2line::Location>) -> String {
@@ -95,7 +96,7 @@ impl PProfRecordTreeNode {
 }
 
 // Main handler.
-struct PProfLogger {
+pub struct PProfLogger {
     atsl_context:
         addr2line::Context<addr2line::gimli::EndianReader<addr2line::gimli::RunTimeEndian, std::rc::Rc<[u8]>>>,
     tree_root: Rc<RefCell<PProfRecordTreeNode>>,
@@ -104,7 +105,7 @@ struct PProfLogger {
 }
 
 impl PProfLogger {
-    fn new(filename: String) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_path(filename: String) -> Result<Self, Box<dyn std::error::Error>> {
         let file = std::fs::File::open(filename)?;
         let mmap = unsafe { memmap::Mmap::map(&file)? };
         let object = object::File::parse(&*mmap)?;
@@ -117,18 +118,32 @@ impl PProfLogger {
             ra_dict: HashMap::new(),
         })
     }
+    pub fn from_data(program: &Bytes) -> Result<Self, Box<dyn std::error::Error>> {
+        let object = object::File::parse(&program)?;
+        let ctx = addr2line::Context::new(&object)?;
+        let tree_root = Rc::new(RefCell::new(PProfRecordTreeNode::root()));
+        Ok(Self {
+            atsl_context: ctx,
+            tree_root: tree_root.clone(),
+            tree_node: tree_root,
+            ra_dict: HashMap::new(),
+        })
+    }
 }
 
-impl<'a, R: Register, M: Memory<REG = R>, Inner: ckb_vm::machine::SupportMachine<REG = R, MEM = M>>
-    machine::PProfLogger<ckb_vm::machine::DefaultMachine<'a, Inner>> for PProfLogger
-{
-    fn on_step(&mut self, machine: &mut ckb_vm::machine::DefaultMachine<'a, Inner>) {
-        let pc = machine.pc().to_u64();
-        let decoder = ckb_vm::decoder::build_decoder::<R>(machine.isa());
-        let inst = decoder.decode(machine.memory_mut(), pc).unwrap();
+impl PProfLogger {
+    fn on_step<'a>(&mut self, machine: &mut AsmMachine<'a>) {
+        let pc = machine.machine.pc().to_u64();
+        let mut decoder = ckb_vm::decoder::build_decoder::<u64>(machine.machine.isa());
+        let inst = decoder.decode(machine.machine.memory_mut(), pc).unwrap();
         let inst_length = instruction_length(inst) as u64;
         let opcode = ckb_vm::instructions::extract_opcode(inst);
-        let cycles = machine.instruction_cycle_func().as_ref().map(|f| f(inst)).unwrap_or(0);
+        let cycles = machine
+            .machine
+            .instruction_cycle_func()
+            .as_ref()
+            .map(|f| f(inst))
+            .unwrap_or(0);
         self.tree_node.borrow_mut().cycles += cycles;
 
         let once = |s: &mut Self, addr: u64, link: u64| {
@@ -160,7 +175,7 @@ impl<'a, R: Register, M: Memory<REG = R>, Inner: ckb_vm::machine::SupportMachine
         };
         if opcode == ckb_vm::instructions::insts::OP_JALR {
             let inst = ckb_vm::instructions::Itype(inst);
-            let base = machine.registers()[inst.rs1()].to_u64();
+            let base = machine.machine.registers()[inst.rs1()].to_u64();
             let addr = base.wrapping_add(inst.immediate_s() as u64) & 0xfffffffffffffffe;
             let link = pc + inst_length;
             if self.ra_dict.contains_key(&addr) {
@@ -191,9 +206,94 @@ impl<'a, R: Register, M: Memory<REG = R>, Inner: ckb_vm::machine::SupportMachine
         }
     }
 
-    fn on_exit(&mut self, machine: &mut ckb_vm::machine::DefaultMachine<'a, Inner>) {
-        assert_eq!(machine.exit_code(), 0);
+    fn on_exit<'a>(&mut self, machine: &mut AsmMachine<'a>) {
+        assert_eq!(machine.machine.exit_code(), 0);
         self.tree_root.borrow().display_flamegraph("", &mut std::io::stdout());
+    }
+}
+
+pub struct PProfMachine<'a> {
+    pub machine: AsmMachine<'a>,
+    pprof_logger: Option<PProfLogger>,
+}
+
+impl CoreMachine for PProfMachine<'_> {
+    type REG = u64;
+    type MEM = Box<AsmCoreMachine>;
+
+    fn pc(&self) -> &Self::REG {
+        &self.machine.machine.pc()
+    }
+
+    fn update_pc(&mut self, pc: Self::REG) {
+        self.machine.machine.update_pc(pc)
+    }
+
+    fn commit_pc(&mut self) {
+        self.machine.machine.commit_pc()
+    }
+
+    fn memory(&self) -> &Self::MEM {
+        self.machine.machine.memory()
+    }
+
+    fn memory_mut(&mut self) -> &mut Self::MEM {
+        self.machine.machine.memory_mut()
+    }
+
+    fn registers(&self) -> &[Self::REG] {
+        self.machine.machine.registers()
+    }
+
+    fn set_register(&mut self, idx: usize, value: Self::REG) {
+        self.machine.machine.set_register(idx, value)
+    }
+
+    fn isa(&self) -> u8 {
+        self.machine.machine.isa()
+    }
+
+    fn version(&self) -> u32 {
+        self.machine.machine.version()
+    }
+}
+
+impl Machine for PProfMachine<'_> {
+    fn ecall(&mut self) -> Result<(), Error> {
+        self.machine.machine.ecall()
+    }
+
+    fn ebreak(&mut self) -> Result<(), Error> {
+        self.machine.machine.ebreak()
+    }
+}
+
+impl<'a> PProfMachine<'a> {
+    pub fn new(machine: AsmMachine<'a>) -> Self {
+        Self {
+            machine,
+            pprof_logger: None,
+        }
+    }
+
+    pub fn load_program(&mut self, program: &Bytes, args: &[Bytes]) -> Result<u64, Error> {
+        self.pprof_logger = Some(PProfLogger::from_data(program).or(Err(Error::ParseError))?);
+        self.machine.load_program(program, args)
+    }
+
+    pub fn run(&mut self) -> Result<i8, Error> {
+        let mut decoder = build_decoder::<u64>(self.isa());
+        self.machine.machine.set_running(true);
+        if let Some(pprof_logger) = self.pprof_logger.as_mut() {
+            while self.machine.machine.running() {
+                pprof_logger.on_step(&mut self.machine);
+                self.machine.step(&mut decoder)?;
+            }
+            pprof_logger.on_exit(&mut self.machine);
+        } else {
+            unreachable!();
+        }
+        Ok(self.machine.machine.exit_code())
     }
 }
 
@@ -222,16 +322,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let code_data = std::fs::read(fl_bin)?;
     let code = Bytes::from(code_data);
 
-    let default_core_machine = ckb_vm::DefaultCoreMachine::<u64, ckb_vm::SparseMemory<u64>>::new(
+    let asm_core_machine = AsmCoreMachine::new(
         ckb_vm::ISA_IMC | ckb_vm::ISA_B | ckb_vm::ISA_MOP,
         ckb_vm::machine::VERSION1,
-        1 << 32,
+        u64::MAX,
     );
-    let default_machine_builder = ckb_vm::DefaultMachineBuilder::new(default_core_machine)
-        .instruction_cycle_func(Box::new(cost_model::instruction_cycles));
-    let default_machine = default_machine_builder.build();
-    let pprof_func_provider = Box::new(PProfLogger::new(String::from(fl_bin))?);
-    let mut machine = machine::PProfMachine::new(default_machine, pprof_func_provider);
+    let default_machine = DefaultMachineBuilder::new(asm_core_machine)
+        .instruction_cycle_func(Box::new(cost_model::instruction_cycles))
+        .build();
+    let asm_machine = AsmMachine::new(default_machine, None);
+    let mut machine = PProfMachine::new(asm_machine);
+
     let mut args = vec![fl_bin.to_string().into()];
     args.append(&mut fl_arg.iter().map(|x| Bytes::from(x.to_string())).collect());
     machine.load_program(&code, &args).unwrap();
