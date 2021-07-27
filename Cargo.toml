@@ -9,7 +9,9 @@ edition = "2018"
 [dependencies]
 addr2line = "0.13.0"
 # ckb-vm = { version = "0.20.0-rc1", features=["asm"] }
+# ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", branch="develop", features=["asm"] }
 ckb-vm = { path = "/src/ckb-vm", features=["asm"] }
+ckb-vm-definitions = { path = "/src/ckb-vm/definitions" }
 clap = "2.33"
 memmap = "0.7"
 object = "0.20"
