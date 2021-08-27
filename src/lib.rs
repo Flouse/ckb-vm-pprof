@@ -90,9 +90,12 @@ impl TrieNode {
 
     fn display_flamegraph(&self, prefix: &str, writer: &mut impl std::io::Write) {
         let prefix_name = format!("{}{}", prefix, self.name);
-        writer.write_all(format!("{} {}\n", prefix_name, self.cycles).as_bytes()).unwrap();
+        writer
+            .write_all(format!("{} {}\n", prefix_name, self.cycles).as_bytes())
+            .unwrap();
         for e in &self.childs {
-            e.borrow().display_flamegraph(format!("{}; ", prefix_name).as_str(), writer);
+            e.borrow()
+                .display_flamegraph(format!("{}; ", prefix_name).as_str(), writer);
         }
     }
 
@@ -140,24 +143,6 @@ impl Profile {
         })
     }
 
-    pub fn from_bytes(program: &ckb_vm::Bytes) -> Result<Self, Box<dyn std::error::Error>> {
-        let object = object::File::parse(&program)?;
-        let ctx = addr2line::Context::new(&object)?;
-        let tree_root = std::rc::Rc::new(RefCell::new(PProfRecordTreeNode::root()));
-        // millisecond
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("timestamp")
-            .as_millis() as u64;
-        Ok(Self {
-            atsl_context: ctx,
-            tree_root: tree_root.clone(),
-            tree_node: tree_root,
-            ra_dict: std::collections::HashMap::new(),
-            output_filename: format!("pprof_{}", timestamp),
-        })
-    }
-
     pub fn get_tag(&mut self, addr: u64) -> String {
         if let Some(data) = self.cache_tag.get(&addr) {
             return data.clone();
@@ -169,6 +154,16 @@ impl Profile {
         let tag_string = format!("{}:{}", loc_string, fun_string);
         self.cache_tag.insert(addr, tag_string.clone());
         tag_string
+    }
+
+    pub fn write_pprof_log(&self, output_filename_prefix: &str) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("timestamp")
+            .as_millis() as u64;
+        let output_filename = format!("{}-pprof_log-{}", output_filename_prefix, timestamp);
+        let mut output = std::fs::File::create(&output_filename).expect("can't create file");
+        self.trie_root.borrow().display_flamegraph("", &mut output);
     }
 }
 
@@ -365,7 +360,9 @@ pub fn quick_start<'a>(
     let default_core_machine = CoreMachineType::new(isa, ckb_vm::machine::VERSION1, 1 << 32);
     let mut builder = DefaultMachineBuilder::new(default_core_machine)
         .instruction_cycle_func(Box::new(cost_model::instruction_cycles));
-    builder = syscalls.into_iter().fold(builder, |builder, syscall| builder.syscall(syscall));
+    builder = syscalls
+        .into_iter()
+        .fold(builder, |builder, syscall| builder.syscall(syscall));
     let default_machine = builder.build();
     let profile = Profile::new(&code).unwrap();
     let mut machine = PProfMachine::new(default_machine, profile);
@@ -375,15 +372,25 @@ pub fn quick_start<'a>(
     let result = machine.run();
 
     if let Err(err) = result {
-        machine.profile.trie_node.borrow().display_stacktrace(&mut std::io::stdout());
+        machine
+            .profile
+            .trie_node
+            .borrow()
+            .display_stacktrace(&mut std::io::stdout());
         let loc = machine.profile.addrctx.find_location(*machine.pc()).unwrap();
-        std::io::stdout().write_all(sprint_loc_file_line(&loc).as_bytes()).unwrap();
+        std::io::stdout()
+            .write_all(sprint_loc_file_line(&loc).as_bytes())
+            .unwrap();
         std::io::stdout().write_all(b"\n").unwrap();
         return Err(err);
     }
 
     if output_filename == "-" {
-        machine.profile.trie_root.borrow().display_flamegraph("", &mut std::io::stdout());
+        machine
+            .profile
+            .trie_root
+            .borrow()
+            .display_flamegraph("", &mut std::io::stdout());
     } else {
         let mut output = std::fs::File::create(&output_filename).expect("can't create file");
         machine.profile.trie_root.borrow().display_flamegraph("", &mut output);
